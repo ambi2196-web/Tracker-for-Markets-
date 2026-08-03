@@ -1,0 +1,21 @@
+# Raw archive and derived database are local-only per SIGNAL_TRACKER_REQUIREMENTS.md §4.5
+# (exchange data is personal-use only; the archive is rebuildable, not something to redistribute)
+data/raw/
+data/*.db
+data/*.db-journal
+
+# Fully derived outputs (regenerate, don't version)
+out/
+
+# Run logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Phase 0 spike scratch downloads (findings.md and spike_test.py are kept; ad-hoc CSVs are not)
+phase0_spike/*.csv
