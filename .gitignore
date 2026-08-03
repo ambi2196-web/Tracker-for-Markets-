@@ -3,6 +3,7 @@
 data/raw/
 data/*.db
 data/*.db-journal
+data/health.json
 
 # Fully derived outputs (regenerate, don't version)
 out/
