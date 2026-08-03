@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8532", "--directory", "out"],
+      "port": 8532
+    }
+  ]
+}

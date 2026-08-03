@@ -75,7 +75,10 @@ def run(run_date: date, *, dry_run: bool) -> int:
                 outcome.bytes_written,
                 outcome.elapsed_seconds or 0.0,
             )
-            if outcome.status == "success" and not dry_run:
+            if not dry_run:
+                # already_archived means the source's data for this date is confirmed
+                # present and valid — that's as much a health success as a fresh fetch,
+                # and treating it otherwise made a same-day re-run look falsely stale.
                 health.record_success(mod.SOURCE, now_iso)
         else:
             logger.error("[%s] FAILED url=%s detail=%s", outcome.source, outcome.url, outcome.detail)
