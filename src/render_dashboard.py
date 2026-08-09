@@ -138,6 +138,56 @@ def _recent_events(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
     ]
 
 
+MIN_OBSERVATIONS_FOR_VERDICT = 20  # SIGNAL_TRACKER_REQUIREMENTS.md §9 reporting rule
+
+
+def _action_required(conn: sqlite3.Connection) -> list[dict]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT symbol, signal_type, state, window_end
+            FROM signals
+            WHERE state IN ('armed', 'open', 'exit_due')
+            ORDER BY (window_end IS NULL), window_end
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"symbol": s, "signal_type": t, "state": st, "window_end": we} for s, t, st, we in rows]
+
+
+def _ledger_summary(conn: sqlite3.Connection) -> list[dict]:
+    """Per §9: never pool paper/live, and (extended here) never pool long/short since
+    direction is explicitly undetermined for this signal type. No verdict below the
+    20-closed-observation floor — count only."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT s.signal_type, l.direction, l.mode,
+                   COUNT(*) AS n_closed,
+                   AVG(l.net_return_pct) AS mean_net,
+                   SUM(CASE WHEN l.net_return_pct > 0 THEN 1 ELSE 0 END) AS n_wins,
+                   MIN(l.net_return_pct) AS worst,
+                   AVG(l.holding_days) AS mean_holding_days
+            FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
+            WHERE l.exit_date IS NOT NULL
+            GROUP BY s.signal_type, l.direction, l.mode
+            ORDER BY s.signal_type, l.direction
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for signal_type, direction, mode, n, mean_net, n_wins, worst, mean_hold in rows:
+        out.append({
+            "signal_type": signal_type, "direction": direction, "mode": mode, "n_closed": n,
+            "hit_rate": (n_wins / n * 100.0) if n else None,
+            "mean_net": mean_net, "worst": worst, "mean_holding_days": mean_hold,
+            "verdict_ready": n >= MIN_OBSERVATIONS_FOR_VERDICT,
+        })
+    return out
+
+
 def _fmt(v, spec="") -> str:
     if v is None:
         return "&mdash;"
@@ -153,10 +203,14 @@ def render() -> str:
     if conn is not None:
         latest_date, snapshot, stats = _price_snapshot(conn)
         events = _recent_events(conn)
+        action_items = _action_required(conn)
+        ledger_summary = _ledger_summary(conn)
         conn.close()
     else:
         latest_date, snapshot, stats = None, [], {}
         events = []
+        action_items = []
+        ledger_summary = []
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -193,6 +247,32 @@ def render() -> str:
         </tr>"""
         for r in snapshot
     ) or '<tr><td colspan="5">No price data yet — run build_db.py --live after the first collection.</td></tr>'
+
+    action_html = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(a['symbol'])}</td>
+          <td>{html.escape(a['signal_type'])}</td>
+          <td>{html.escape(a['state'])}</td>
+          <td>{html.escape(a['window_end']) if a['window_end'] else '&mdash;'}</td>
+        </tr>"""
+        for a in action_items
+    ) or '<tr><td colspan="4">Nothing pending &mdash; no signal is currently armed, open, or exit-due.</td></tr>'
+
+    ledger_html = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(r['signal_type'])}</td>
+          <td>{html.escape(r['direction'])}</td>
+          <td>{html.escape(r['mode'])}</td>
+          <td class="num">{r['n_closed']}</td>
+          <td class="num">{_fmt(r['hit_rate'], '.0f') + '%' if r['hit_rate'] is not None else '&mdash;'}</td>
+          <td class="num {'pos' if (r['mean_net'] or 0) > 0 else 'neg' if (r['mean_net'] or 0) < 0 else ''}">{_fmt(r['mean_net'], '+.2f') + '%' if r['mean_net'] is not None else '&mdash;'}</td>
+          <td class="num neg">{_fmt(r['worst'], '+.2f') + '%' if r['worst'] is not None else '&mdash;'}</td>
+          <td>{'' if r['verdict_ready'] else f"insufficient sample ({r['n_closed']}/{MIN_OBSERVATIONS_FOR_VERDICT})"}</td>
+        </tr>"""
+        for r in ledger_summary
+    ) or '<tr><td colspan="8">No closed paper trades yet.</td></tr>'
 
     events_html = "\n".join(
         f"""
@@ -285,7 +365,10 @@ def render() -> str:
 
   <div class="panel">
     <h2>Action required</h2>
-    <div class="placeholder">Not available yet &mdash; requires Phase 4 (signal state machine + ledger). Nothing to show until signals exist.</div>
+    <table>
+      <thead><tr><th>Symbol</th><th>Signal type</th><th>State</th><th>Window end</th></tr></thead>
+      <tbody>{action_html}</tbody>
+    </table>
   </div>
 
   <div class="panel">
@@ -319,13 +402,17 @@ def render() -> str:
   </div>
 
   <div class="panel">
-    <h2>Ledger summary</h2>
-    <div class="placeholder">Not available yet &mdash; requires Phase 4. No signal type has any closed paper observations.</div>
+    <h2>Ledger summary (paper)</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Direction</th><th>Mode</th><th>Closed</th><th>Hit rate</th><th>Mean net</th><th>Worst</th><th>Verdict</th></tr></thead>
+      <tbody>{ledger_html}</tbody>
+    </table>
+    <div class="maxrows">Net return only (costs included), per §9. No verdict below {MIN_OBSERVATIONS_FOR_VERDICT} closed observations &mdash; count reported instead.</div>
   </div>
 
   <div class="panel">
     <h2>Recent state transitions</h2>
-    <div class="placeholder">Not available yet &mdash; requires Phase 4.</div>
+    <div class="placeholder">Not implemented yet &mdash; signals/ledger currently show only latest state, not a change history.</div>
   </div>
 
 <script>

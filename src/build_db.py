@@ -87,6 +87,43 @@ CREATE TABLE IF NOT EXISTS events (
     ingested_at TEXT NOT NULL,
     pipeline_version TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS signals (
+    signal_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    symbol TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    state TEXT NOT NULL,
+    armed_date TEXT,
+    window_start TEXT,
+    window_end TEXT,
+    entry_date TEXT,
+    entry_ref_price REAL,
+    stop_price REAL,
+    invalidation_reason TEXT,
+    filters_passed TEXT,
+    updated_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ledger (
+    ledger_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL REFERENCES signals(signal_id),
+    mode TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_date TEXT,
+    entry_price REAL,
+    exit_date TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+    gross_return_pct REAL,
+    costs_pct REAL,
+    net_return_pct REAL,
+    holding_days INTEGER,
+    notes TEXT,
+    updated_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL
+);
 """
 
 
@@ -98,8 +135,32 @@ def discover_bhavcopy_files(data_root: Path) -> list[Path]:
     return sorted((data_root / "raw" / "bhavcopy").glob("*/*/*.csv"))
 
 
-def ingest_bhavcopy_file(conn: sqlite3.Connection, path: Path, *, now_iso: str) -> bhavcopy.ParseResult:
+def _filename_date_ddmmyyyy(path: Path) -> date | None:
+    digits = "".join(ch for ch in path.stem if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[-8:], "%d%m%Y").date()
+    except ValueError:
+        return None
+
+
+def ingest_bhavcopy_file(conn: sqlite3.Connection, path: Path, *, now_iso: str) -> bhavcopy.ParseResult | None:
+    """Returns None (and ingests nothing) if the file's own DATE1 content disagrees with
+    its filename — NSE's bhavcopy archive endpoint has been observed silently serving the
+    prior trading day's file under a holiday's filename instead of a clean 404 (found via
+    the byte-identical 2026-06-25/2026-06-26 files during Phase 4). Ingesting it anyway
+    would corrupt source_file provenance for the genuine date without adding any real
+    data — the correctly-named file for the actual date already covers it."""
     result = bhavcopy.parse_file(path)
+    if result.rows:
+        content_date = date.fromisoformat(result.rows[0].date)
+        filename_date = _filename_date_ddmmyyyy(path)
+        if filename_date is not None and content_date != filename_date:
+            print(f"WARNING: skipping {path} — filename implies {filename_date} but content is "
+                  f"dated {content_date} (NSE likely re-served a prior day's file for a holiday)")
+            return None
+
     source_file = path.relative_to(DATA_ROOT).as_posix()
     conn.executemany(
         """
@@ -180,6 +241,8 @@ def run_live_or_rebuild(*, rebuild: bool, dry_run: bool) -> int:
         total_rows = 0
         for path in files:
             result = ingest_bhavcopy_file(conn, path, now_iso=now_iso)
+            if result is None:
+                continue
             total_rows += len(result.rows)
             print(f"ingested {path.relative_to(DATA_ROOT)}: {len(result.rows)} rows")
         n_health = ingest_health(conn, HEALTH_JSON_PATH)
@@ -210,6 +273,8 @@ def run_replay(from_date: date, to_date: date, *, out_path: Path, dry_run: bool)
         total_rows = 0
         for path in files:
             result = ingest_bhavcopy_file(conn, path, now_iso=now_iso)
+            if result is None:
+                continue
             total_rows += len(result.rows)
         conn.commit()
         print(f"[replay {from_date}..{to_date}] {len(files)} files, {total_rows} price rows "
