@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS health (
     consecutive_failures INTEGER,
     last_error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    announce_date TEXT,
+    effective_date TEXT NOT NULL,
+    detail TEXT,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL
+);
 """
 
 

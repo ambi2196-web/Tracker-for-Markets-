@@ -118,6 +118,26 @@ def _price_snapshot(conn: sqlite3.Connection) -> tuple[str | None, list[dict], d
     return latest_date, snapshot, stats
 
 
+def _recent_events(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_type, symbol, effective_date, source_file
+            FROM events
+            WHERE event_type IN ('fo_ban_entry', 'fo_ban_exit')
+            ORDER BY effective_date DESC, symbol
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # events table doesn't exist yet (build_events.py not run)
+    return [
+        {"event_type": t, "symbol": s, "effective_date": d, "source_file": sf}
+        for t, s, d, sf in rows
+    ]
+
+
 def _fmt(v, spec="") -> str:
     if v is None:
         return "&mdash;"
@@ -132,9 +152,11 @@ def render() -> str:
     conn = sqlite3.connect(DB_PATH) if DB_PATH.exists() else None
     if conn is not None:
         latest_date, snapshot, stats = _price_snapshot(conn)
+        events = _recent_events(conn)
         conn.close()
     else:
         latest_date, snapshot, stats = None, [], {}
+        events = []
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -171,6 +193,19 @@ def render() -> str:
         </tr>"""
         for r in snapshot
     ) or '<tr><td colspan="5">No price data yet — run build_db.py --live after the first collection.</td></tr>'
+
+    events_html = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(e['effective_date'])}</td>
+          <td>{html.escape(e['symbol'])}</td>
+          <td class="{'neg' if e['event_type'] == 'fo_ban_entry' else 'pos'}">
+            {'entered ban' if e['event_type'] == 'fo_ban_entry' else 'exited ban'}
+          </td>
+          <td style="font-size:0.78rem;color:var(--muted)">{html.escape(e['source_file'])}</td>
+        </tr>"""
+        for e in events
+    ) or '<tr><td colspan="4">No events yet &mdash; run build_events.py after collecting fo_ban data.</td></tr>'
 
     coverage_note = (
         f"{stats.get('distinct_dates', 0)} trading day(s) archived "
@@ -254,8 +289,17 @@ def render() -> str:
   </div>
 
   <div class="panel">
+    <h2>Recent F&amp;O ban events</h2>
+    <table>
+      <thead><tr><th>Date</th><th>Symbol</th><th>Event</th><th>Source file</th></tr></thead>
+      <tbody>{events_html}</tbody>
+    </table>
+    <div class="maxrows">Read-only event log (Phase 3) &mdash; not a trade signal. Run build_events.py after each collection to refresh.</div>
+  </div>
+
+  <div class="panel">
     <h2>Calendar (next 30 days)</h2>
-    <div class="placeholder">Not available yet &mdash; requires Phase 3 (event detection). Nothing to show until events are ingested.</div>
+    <div class="placeholder">Not available yet &mdash; requires Phase 4 (signal windows). Phase 3 only detects events after the fact; it doesn't project forward.</div>
   </div>
 
   <div class="panel">
