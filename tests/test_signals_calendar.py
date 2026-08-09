@@ -18,6 +18,17 @@ class TestTradingCalendar(unittest.TestCase):
     def test_add_trading_days_returns_none_when_archive_too_short(self):
         self.assertIsNone(add_trading_days(DAYS, date(2026, 1, 13), 5))
 
+    def test_add_trading_days_negative_n_goes_backward(self):
+        self.assertEqual(add_trading_days(DAYS, date(2026, 1, 14), -1), date(2026, 1, 13))
+        self.assertEqual(add_trading_days(DAYS, date(2026, 1, 14), -5), date(2026, 1, 7))
+
+    def test_add_trading_days_negative_n_none_when_not_enough_history(self):
+        self.assertIsNone(add_trading_days(DAYS, date(2026, 1, 6), -10))
+
+    def test_add_trading_days_zero_returns_self_if_known_else_none(self):
+        self.assertEqual(add_trading_days(DAYS, date(2026, 1, 8), 0), date(2026, 1, 8))
+        self.assertIsNone(add_trading_days(DAYS, date(2026, 1, 10), 0))  # weekend gap
+
     def test_sessions_up_to_respects_lookback_and_boundary(self):
         self.assertEqual(sessions_up_to(DAYS, date(2026, 1, 9), 3), [date(2026, 1, 7), date(2026, 1, 8), date(2026, 1, 9)])
         # shorter than lookback near the start of the archive

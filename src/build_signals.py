@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Phase 4 — signal state machine and paper ledger.
+Phase 4 — signal state machine and paper ledger. Extended in Phase 6 (src/signals/ipo_lockin.py)
+to prove the same engine generalizes to a second signal type — see src/signals/engine.py.
 
-Builds fo_ban_exit signals (SIGNAL_TRACKER_REQUIREMENTS.md §7.1) from Phase 3's events,
-and both-direction paper ledger rows (long + short — direction is explicitly undetermined,
-see src/signals/fo_ban_exit.py). Every write happens inside a single transaction per run:
-nothing commits until the whole batch succeeds, so a crash mid-run leaves the database
-exactly as it was before the run started — never a half-transitioned signal.
+Builds signals from Phase 3's events (fo_ban_exit per §7.1, ipo_lockin per §7.2) and
+both-direction paper ledger rows (long + short — direction is explicitly undetermined for
+both types, see src/signals/engine.py). Every write happens inside a single transaction
+per run: nothing commits until the whole batch succeeds, so a crash mid-run leaves the
+database exactly as it was before the run started — never a half-transitioned signal.
 
-The lookahead-safety assertion (no price row used to arm a signal may be dated after the
-arming date) is not a separate opt-in check — it runs unconditionally inside
-signals.fo_ban_exit.build_signals() on every invocation of any mode below.
+The lookahead-safety assertion for fo_ban_exit (no price row used to arm a signal may be
+dated after the arming date) is not a separate opt-in check — it runs unconditionally
+inside signals.fo_ban_exit.build_signals() on every invocation of any mode below.
 
 Modes mirror build_db.py / build_events.py:
     --live       Full events/prices archive -> data/tracker.db (upsert; safe to rerun).
-    --rebuild    Clear existing fo_ban_exit signal/ledger rows first, then --live.
+    --rebuild    Clear existing signal/ledger rows for both types first, then --live.
     --replay FROM TO
-                 Only events with effective_date in [FROM, TO] -> a scratch database.
+                 Only signals whose arming date falls in [FROM, TO] -> a scratch database.
     --dry-run    Compute and print a summary, write nothing.
 
 Usage:
@@ -36,13 +37,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from signals import fo_ban_exit  # noqa: E402
+from signals import fo_ban_exit, ipo_lockin  # noqa: E402
 from build_db import create_schema  # noqa: E402
 
+SIGNAL_MODULES = [fo_ban_exit, ipo_lockin]
 DATA_ROOT = REPO_ROOT / "data"
 DEFAULT_DB_PATH = DATA_ROOT / "tracker.db"
 DEFAULT_REPLAY_DB_PATH = DATA_ROOT / "scratch_replay_signals.db"
 PIPELINE_VERSION = "0.1.0"
+
+
+def _build_all(conn: sqlite3.Connection):
+    """Runs every signal-type module against the same connection — this is what proves
+    §6's acceptance test ('both signal types run concurrently without interference')."""
+    all_signals, all_ledger = [], []
+    for mod in SIGNAL_MODULES:
+        signals, ledger = mod.build_signals(conn)
+        all_signals.extend(signals)
+        all_ledger.extend(ledger)
+    return all_signals, all_ledger
 
 
 def _write(conn: sqlite3.Connection, signal_rows, ledger_rows, *, now_iso: str) -> None:
@@ -60,7 +73,7 @@ def _write(conn: sqlite3.Connection, signal_rows, ledger_rows, *, now_iso: str) 
             updated_at=excluded.updated_at, pipeline_version=excluded.pipeline_version
         """,
         [
-            (s.signal_id, s.event_id, s.symbol, fo_ban_exit.SIGNAL_TYPE, s.state, s.armed_date,
+            (s.signal_id, s.event_id, s.symbol, s.signal_type, s.state, s.armed_date,
              s.window_start, s.window_end, s.entry_date, s.entry_ref_price, s.stop_price,
              s.invalidation_reason, json.dumps(s.filters_passed), now_iso, PIPELINE_VERSION)
             for s in signal_rows
@@ -103,16 +116,17 @@ def run_live_or_rebuild(*, rebuild: bool, dry_run: bool) -> int:
     conn = sqlite3.connect(DEFAULT_DB_PATH)
     try:
         create_schema(conn)
-        signal_rows, ledger_rows = fo_ban_exit.build_signals(conn)
+        signal_rows, ledger_rows = _build_all(conn)
 
         if dry_run:
             print(f"[dry-run] {_summarize(signal_rows, ledger_rows)}. Nothing written.")
             return 0
 
         if rebuild:
-            conn.execute("DELETE FROM ledger WHERE signal_id IN (SELECT signal_id FROM signals WHERE signal_type=?)", (fo_ban_exit.SIGNAL_TYPE,))
-            conn.execute("DELETE FROM signals WHERE signal_type=?", (fo_ban_exit.SIGNAL_TYPE,))
-            print("[rebuild] cleared existing fo_ban_exit signal/ledger rows")
+            for mod in SIGNAL_MODULES:
+                conn.execute("DELETE FROM ledger WHERE signal_id IN (SELECT signal_id FROM signals WHERE signal_type=?)", (mod.SIGNAL_TYPE,))
+                conn.execute("DELETE FROM signals WHERE signal_type=?", (mod.SIGNAL_TYPE,))
+            print(f"[rebuild] cleared existing signal/ledger rows for {[m.SIGNAL_TYPE for m in SIGNAL_MODULES]}")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         _write(conn, signal_rows, ledger_rows, now_iso=now_iso)
@@ -131,7 +145,7 @@ def run_replay(from_date: date, to_date: date, *, out_path: Path, dry_run: bool)
     # ADV lookback, then filters to signals whose *arming* event falls in the window.
     conn = sqlite3.connect(DEFAULT_DB_PATH)
     try:
-        signal_rows, ledger_rows = fo_ban_exit.build_signals(conn)
+        signal_rows, ledger_rows = _build_all(conn)
     finally:
         conn.close()
 

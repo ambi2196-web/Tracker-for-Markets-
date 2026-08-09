@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 3 — F&O ban list event detection.
+Phase 3 — F&O ban list event detection. Extended in Phase 6 to also generate IPO
+lock-in unlock events (SIGNAL_TRACKER_REQUIREMENTS.md §7.2) from the manually-maintained
+data/seed/ipo_listings.csv — a direct derivation, not a detection, since those dates are
+already known in advance; see src/events/ipo_lockin.py.
 
 Parses the raw fo_ban archive into BanSnapshots (one per day actually on disk — gaps in
 the archive, whatever their cause, are simply absent), diffs consecutive snapshots, and
@@ -37,12 +40,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from events import fo_ban as fo_ban_events  # noqa: E402
+from events import ipo_lockin as ipo_events  # noqa: E402
 from parse import fo_ban as fo_ban_parse  # noqa: E402
+from parse import ipo_listings  # noqa: E402
 from build_db import create_schema  # noqa: E402
 
 DATA_ROOT = REPO_ROOT / "data"
 DEFAULT_DB_PATH = DATA_ROOT / "tracker.db"
 DEFAULT_REPLAY_DB_PATH = DATA_ROOT / "scratch_replay_events.db"
+IPO_LISTINGS_PATH = DATA_ROOT / "seed" / "ipo_listings.csv"
 
 PIPELINE_VERSION = "0.1.0"
 SOURCE_EVENT_TYPES = (fo_ban_events.EVENT_TYPE_ENTRY, fo_ban_events.EVENT_TYPE_EXIT)
@@ -72,7 +78,13 @@ def load_snapshots(files: list[Path]) -> list[tuple[fo_ban_parse.BanSnapshot, st
     return pairs
 
 
-def write_events(conn: sqlite3.Connection, evts: list[fo_ban_events.BanEvent], *, now_iso: str) -> None:
+def generate_ipo_events() -> list[ipo_events.IpoLockinEvent]:
+    listings = ipo_listings.parse_file(IPO_LISTINGS_PATH)
+    source_file = IPO_LISTINGS_PATH.relative_to(DATA_ROOT).as_posix()
+    return ipo_events.generate_events(listings, source_file)
+
+
+def write_events(conn: sqlite3.Connection, evts, *, now_iso: str) -> None:
     import json
     conn.executemany(
         """
@@ -94,22 +106,25 @@ def write_events(conn: sqlite3.Connection, evts: list[fo_ban_events.BanEvent], *
 def run_live_or_rebuild(*, rebuild: bool, dry_run: bool) -> int:
     files = discover_fo_ban_files(DATA_ROOT)
     pairs = load_snapshots(files)
-    evts = fo_ban_events.detect(pairs)
+    ban_evts = fo_ban_events.detect(pairs)
+    ipo_evts = generate_ipo_events()
+    evts = [*ban_evts, *ipo_evts]
 
     if dry_run:
         n_days_nil = sum(1 for snap, _ in pairs if not snap.symbols)
-        print(f"[dry-run] {len(pairs)} archived days ({n_days_nil} NIL), "
-              f"{len(evts)} events detected "
-              f"({sum(1 for e in evts if e.event_type == 'fo_ban_entry')} entries, "
-              f"{sum(1 for e in evts if e.event_type == 'fo_ban_exit')} exits). Nothing written.")
+        print(f"[dry-run] {len(pairs)} archived fo_ban days ({n_days_nil} NIL), "
+              f"{len(ban_evts)} ban events "
+              f"({sum(1 for e in ban_evts if e.event_type == 'fo_ban_entry')} entries, "
+              f"{sum(1 for e in ban_evts if e.event_type == 'fo_ban_exit')} exits), "
+              f"{len(ipo_evts)} ipo_lockin_unlock events. Nothing written.")
         return 0
 
     if rebuild and DEFAULT_DB_PATH.exists():
         conn = sqlite3.connect(DEFAULT_DB_PATH)
-        conn.execute("DELETE FROM events WHERE event_type IN (?, ?)", SOURCE_EVENT_TYPES)
+        conn.execute("DELETE FROM events WHERE event_type IN (?, ?, ?)", (*SOURCE_EVENT_TYPES, ipo_events.EVENT_TYPE))
         conn.commit()
         conn.close()
-        print("[rebuild] cleared existing fo_ban_entry/fo_ban_exit rows from events")
+        print("[rebuild] cleared existing fo_ban_entry/fo_ban_exit/ipo_lockin_unlock rows from events")
 
     now_iso = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(DEFAULT_DB_PATH)
@@ -117,8 +132,8 @@ def run_live_or_rebuild(*, rebuild: bool, dry_run: bool) -> int:
         create_schema(conn)
         write_events(conn, evts, now_iso=now_iso)
         conn.commit()
-        print(f"done: {len(pairs)} archived fo_ban days, {len(evts)} events "
-              f"-> {DEFAULT_DB_PATH}")
+        print(f"done: {len(pairs)} archived fo_ban days, {len(ban_evts)} ban events, "
+              f"{len(ipo_evts)} ipo_lockin_unlock events -> {DEFAULT_DB_PATH}")
     finally:
         conn.close()
     return 0
@@ -127,11 +142,13 @@ def run_live_or_rebuild(*, rebuild: bool, dry_run: bool) -> int:
 def run_replay(from_date: date, to_date: date, *, out_path: Path, dry_run: bool) -> int:
     files = discover_fo_ban_files(DATA_ROOT)
     pairs = [(snap, sf) for snap, sf in load_snapshots(files) if from_date <= snap.date <= to_date]
-    evts = fo_ban_events.detect(pairs)
+    ban_evts = fo_ban_events.detect(pairs)
+    ipo_evts = [e for e in generate_ipo_events() if from_date <= date.fromisoformat(e.effective_date) <= to_date]
+    evts = [*ban_evts, *ipo_evts]
 
     if dry_run:
-        print(f"[dry-run][replay {from_date}..{to_date}] {len(pairs)} days, {len(evts)} events. "
-              f"Nothing written.")
+        print(f"[dry-run][replay {from_date}..{to_date}] {len(pairs)} fo_ban days, "
+              f"{len(ban_evts)} ban events, {len(ipo_evts)} ipo_lockin_unlock events. Nothing written.")
         return 0
 
     if out_path.exists():
@@ -143,7 +160,7 @@ def run_replay(from_date: date, to_date: date, *, out_path: Path, dry_run: bool)
         create_schema(conn)
         write_events(conn, evts, now_iso=now_iso)
         conn.commit()
-        print(f"[replay {from_date}..{to_date}] {len(pairs)} days, {len(evts)} events "
+        print(f"[replay {from_date}..{to_date}] {len(pairs)} fo_ban days, {len(evts)} events total "
               f"-> {out_path} (data/tracker.db untouched)")
     finally:
         conn.close()

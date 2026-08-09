@@ -12,12 +12,21 @@ from datetime import date
 
 
 def add_trading_days(trading_days: list[date], from_date: date, n: int) -> date | None:
-    """The date `n` trading days after from_date, per the given sorted trading-day list.
-    n must be >= 1. Returns None if trading_days doesn't extend far enough yet."""
-    assert n >= 1
-    idx = bisect_right(trading_days, from_date)  # first index strictly after from_date
-    target_idx = idx + n - 1
-    if target_idx >= len(trading_days):
+    """The date `n` trading days after from_date (n > 0), or `|n|` trading days before it
+    (n < 0), per the given sorted trading-day list. n == 0 returns from_date itself if it
+    is a known trading day, else None. Returns None whenever the archive doesn't extend
+    far enough in the requested direction yet — callers must wait rather than guess."""
+    if n == 0:
+        return from_date if is_known_trading_day(trading_days, from_date) else None
+    if n > 0:
+        idx = bisect_right(trading_days, from_date)  # first index strictly after from_date
+        target_idx = idx + n - 1
+        if target_idx >= len(trading_days):
+            return None
+        return trading_days[target_idx]
+    idx = bisect_left(trading_days, from_date)  # first index >= from_date
+    target_idx = idx + n  # n is negative
+    if target_idx < 0:
         return None
     return trading_days[target_idx]
 
