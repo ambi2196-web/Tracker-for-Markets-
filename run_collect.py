@@ -4,12 +4,22 @@ Phase 1 raw collector — daily entry point.
 
 Usage:
     python run_collect.py                     # collect for today
-    python run_collect.py --date 2026-08-03    # collect for a specific date (backfill/manual run)
+    python run_collect.py --date 2026-08-03    # collect for a specific date (catch-up run)
     python run_collect.py --dry-run            # print what would be fetched, write nothing
+    python run_collect.py --date 2026-06-26 --no-health
+                                                # ad-hoc/debugging run for an arbitrary past
+                                                # date — does NOT touch data/health.json.
 
 Scope (per PHASED_IMPLEMENTATION_PLAN.md Phase 1): fetch the three daily files, write them
 unmodified into data/raw/, log the attempt, update the health record. No parsing, no
 database, no signals — that's Phase 2 onward.
+
+--no-health exists because data/health.json is supposed to represent "is the live
+scheduled pipeline healthy right now" — a real bug found during Phase 5: a manual
+`--date 2026-06-26` run made to investigate an old archive gap silently overwrote that
+shared health record with an unrelated, permanent 404 from months ago, making the
+dashboard/summary falsely report the live pipeline as failing. Use --no-health for any
+run that isn't either the actual scheduled collection or a genuine same-day catch-up.
 """
 from __future__ import annotations
 
@@ -45,9 +55,10 @@ def setup_logging(run_date: date) -> logging.Logger:
     return logger
 
 
-def run(run_date: date, *, dry_run: bool) -> int:
+def run(run_date: date, *, dry_run: bool, update_health: bool = True) -> int:
     logger = setup_logging(run_date)
     now_iso = datetime.now(timezone.utc).isoformat()
+    track_health = update_health and not dry_run
 
     if not calendar.is_trading_day(run_date):
         logger.info(
@@ -55,14 +66,16 @@ def run(run_date: date, *, dry_run: bool) -> int:
             "health timestamps touched only",
             run_date.isoformat(),
         )
-        for mod in COLLECTORS:
-            health.record_no_op(mod.SOURCE, now_iso, reason="weekend_or_holiday")
+        if track_health:
+            for mod in COLLECTORS:
+                health.record_no_op(mod.SOURCE, now_iso, reason="weekend_or_holiday")
         return 0
 
     client = NSEClient()
     exit_code = 0
     for mod in COLLECTORS:
-        health.record_attempt(mod.SOURCE, now_iso)
+        if track_health:
+            health.record_attempt(mod.SOURCE, now_iso)
         outcome = mod.collect(run_date, DATA_ROOT, client, dry_run=dry_run)
 
         if outcome.status in ("success", "already_archived"):
@@ -75,14 +88,14 @@ def run(run_date: date, *, dry_run: bool) -> int:
                 outcome.bytes_written,
                 outcome.elapsed_seconds or 0.0,
             )
-            if not dry_run:
+            if track_health:
                 # already_archived means the source's data for this date is confirmed
                 # present and valid — that's as much a health success as a fresh fetch,
                 # and treating it otherwise made a same-day re-run look falsely stale.
                 health.record_success(mod.SOURCE, now_iso)
         else:
             logger.error("[%s] FAILED url=%s detail=%s", outcome.source, outcome.url, outcome.detail)
-            if not dry_run:
+            if track_health:
                 health.record_failure(mod.SOURCE, now_iso, outcome.detail)
             exit_code = 1
 
@@ -93,10 +106,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--date", type=str, default=None, help="YYYY-MM-DD, default: today")
     parser.add_argument("--dry-run", action="store_true", help="print what would be fetched, write nothing")
+    parser.add_argument("--no-health", action="store_true",
+                         help="don't touch data/health.json — use for ad-hoc/debugging runs of past dates")
     args = parser.parse_args()
 
     run_date = date.fromisoformat(args.date) if args.date else date.today()
-    return run(run_date, dry_run=args.dry_run)
+    return run(run_date, dry_run=args.dry_run, update_health=not args.no_health)
 
 
 if __name__ == "__main__":
