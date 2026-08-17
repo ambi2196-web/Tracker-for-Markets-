@@ -3,9 +3,10 @@
 Phase 1 raw collector — daily entry point.
 
 Usage:
-    python run_collect.py                     # collect for today
-    python run_collect.py --date 2026-08-03    # collect for a specific date (catch-up run)
+    python run_collect.py                     # collect today + self-healing catch-up sweep
+    python run_collect.py --date 2026-08-03    # collect a specific date, no catch-up sweep
     python run_collect.py --dry-run            # print what would be fetched, write nothing
+    python run_collect.py --catch-up-days 14   # override the sweep window (default 7)
     python run_collect.py --date 2026-06-26 --no-health
                                                 # ad-hoc/debugging run for an arbitrary past
                                                 # date — does NOT touch data/health.json.
@@ -13,6 +14,15 @@ Usage:
 Scope (per PHASED_IMPLEMENTATION_PLAN.md Phase 1): fetch the three daily files, write them
 unmodified into data/raw/, log the attempt, update the health record. No parsing, no
 database, no signals — that's Phase 2 onward.
+
+SELF-HEALING CATCH-UP: a real gap happened in practice — the scheduled task silently
+didn't fire for three consecutive days (machine was off) and the archive stayed broken
+until someone noticed and manually backfilled it. The default (no --date given, i.e. the
+actual scheduled invocation) now also sweeps the last `--catch-up-days` calendar days
+(default 7) for any real trading day still missing from the archive and fetches it too.
+A missed run now self-heals on the next successful one instead of silently persisting
+until caught by hand. This only runs in default "today" mode — an explicit --date is
+always a single, precise request with no side sweep.
 
 --no-health exists because data/health.json is supposed to represent "is the live
 scheduled pipeline healthy right now" — a real bug found during Phase 5: a manual
@@ -26,7 +36,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -102,16 +112,41 @@ def run(run_date: date, *, dry_run: bool, update_health: bool = True) -> int:
     return exit_code
 
 
+def run_catch_up(as_of: date, days_back: int, *, dry_run: bool, update_health: bool) -> int:
+    """Sweep the `days_back` calendar days before `as_of` (oldest first) for any real
+    trading day and (re-)run the normal daily flow for it. Days already fully archived
+    resolve instantly — every collector's first check is "does the file already exist"
+    (see collect/bhavcopy.py etc.), so this costs no extra network calls in the steady
+    state, only when there's an actual gap to fill."""
+    exit_code = 0
+    for offset in range(days_back, 0, -1):
+        d = as_of - timedelta(days=offset)
+        if not calendar.is_trading_day(d):
+            continue
+        result = run(d, dry_run=dry_run, update_health=update_health)
+        exit_code = exit_code or result
+    return exit_code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--date", type=str, default=None, help="YYYY-MM-DD, default: today")
     parser.add_argument("--dry-run", action="store_true", help="print what would be fetched, write nothing")
     parser.add_argument("--no-health", action="store_true",
                          help="don't touch data/health.json — use for ad-hoc/debugging runs of past dates")
+    parser.add_argument("--catch-up-days", type=int, default=None,
+                         help="sweep this many prior calendar days for gaps too. "
+                              "Defaults to 7 when --date is omitted (the scheduled-task case), 0 otherwise.")
     args = parser.parse_args()
 
     run_date = date.fromisoformat(args.date) if args.date else date.today()
-    return run(run_date, dry_run=args.dry_run, update_health=not args.no_health)
+    catch_up_days = args.catch_up_days if args.catch_up_days is not None else (0 if args.date else 7)
+
+    exit_code = 0
+    if catch_up_days > 0:
+        exit_code = run_catch_up(run_date, catch_up_days, dry_run=args.dry_run, update_health=not args.no_health)
+    today_result = run(run_date, dry_run=args.dry_run, update_health=not args.no_health)
+    return today_result or exit_code
 
 
 if __name__ == "__main__":

@@ -29,6 +29,25 @@ class TestTradingCalendar(unittest.TestCase):
         self.assertEqual(add_trading_days(DAYS, date(2026, 1, 8), 0), date(2026, 1, 8))
         self.assertIsNone(add_trading_days(DAYS, date(2026, 1, 10), 0))  # weekend gap
 
+    def test_add_trading_days_forward_from_before_archive_start_is_none(self):
+        # Regression: a from_date far before trading_days[0] must not resolve to a
+        # nonsense date drawn from the archive's first few entries — found for real
+        # during Phase 7 backfilling (events dated ~9 months before the price archive
+        # started were resolving to entry dates in the archive's first week).
+        far_before = date(2025, 1, 1)
+        self.assertIsNone(add_trading_days(DAYS, far_before, 1))
+        self.assertIsNone(add_trading_days(DAYS, far_before, 5))
+
+    def test_add_trading_days_backward_from_after_archive_end_is_none(self):
+        far_after = date(2027, 1, 1)
+        self.assertIsNone(add_trading_days(DAYS, far_after, -1))
+        self.assertIsNone(add_trading_days(DAYS, far_after, -5))
+
+    def test_add_trading_days_empty_archive_returns_none(self):
+        self.assertIsNone(add_trading_days([], date(2026, 1, 5), 1))
+        self.assertIsNone(add_trading_days([], date(2026, 1, 5), -1))
+        self.assertIsNone(add_trading_days([], date(2026, 1, 5), 0))
+
     def test_sessions_up_to_respects_lookback_and_boundary(self):
         self.assertEqual(sessions_up_to(DAYS, date(2026, 1, 9), 3), [date(2026, 1, 7), date(2026, 1, 8), date(2026, 1, 9)])
         # shorter than lookback near the start of the archive

@@ -15,15 +15,31 @@ def add_trading_days(trading_days: list[date], from_date: date, n: int) -> date 
     """The date `n` trading days after from_date (n > 0), or `|n|` trading days before it
     (n < 0), per the given sorted trading-day list. n == 0 returns from_date itself if it
     is a known trading day, else None. Returns None whenever the archive doesn't extend
-    far enough in the requested direction yet — callers must wait rather than guess."""
+    far enough in the requested direction yet — callers must wait rather than guess.
+
+    Also returns None (rather than a silently wrong answer) when from_date itself falls
+    outside the archive's covered range in the direction being asked: a real bug found
+    during Phase 7 backfilling, where events dated ~9 months before the price archive's
+    start resolved to nonsense entry dates in the archive's *first* few days, because
+    bisect on a from_date far before trading_days[0] still returns a small, "valid"
+    insertion index. We have zero visibility into whatever real trading days fell in the
+    unarchived gap, so forward counting from before the archive (or backward counting
+    from after it) cannot be trusted just because the arithmetic produces an in-range
+    index — the safe answer is "we don't know yet", not a guess."""
+    if not trading_days:
+        return None
     if n == 0:
         return from_date if is_known_trading_day(trading_days, from_date) else None
     if n > 0:
+        if from_date < trading_days[0]:
+            return None  # archive doesn't cover the gap between from_date and its start
         idx = bisect_right(trading_days, from_date)  # first index strictly after from_date
         target_idx = idx + n - 1
         if target_idx >= len(trading_days):
             return None
         return trading_days[target_idx]
+    if from_date > trading_days[-1]:
+        return None  # archive doesn't cover the gap between its end and from_date
     idx = bisect_left(trading_days, from_date)  # first index >= from_date
     target_idx = idx + n  # n is negative
     if target_idx < 0:
