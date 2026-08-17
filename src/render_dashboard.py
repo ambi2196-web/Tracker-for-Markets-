@@ -138,6 +138,37 @@ def _recent_events(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
     ]
 
 
+def _insights_bar(conn: sqlite3.Connection, action_items: list[dict], health_rows: list[dict]) -> dict:
+    """Compact at-a-glance stats for the top of the page — counts only, no verdicts (the
+    20-observation floor still applies further down), just enough to answer 'does
+    anything need my attention right now' without scrolling."""
+    try:
+        state_counts = dict(conn.execute("SELECT state, COUNT(*) FROM signals GROUP BY state").fetchall())
+    except sqlite3.OperationalError:
+        state_counts = {}
+
+    try:
+        events_7d = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE effective_date >= date((SELECT MAX(date) FROM prices), '-7 days')"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        events_7d = 0
+
+    urgent_window_end = next((a["window_end"] for a in action_items if a["window_end"]), None)
+    overall_health = "red" if any(r["status"] == "red" for r in health_rows) else (
+        "amber" if any(r["status"] == "amber" for r in health_rows) else "green"
+    )
+
+    return {
+        "needs_attention": len(action_items),
+        "urgent_window_end": urgent_window_end,
+        "open_count": state_counts.get("open", 0) + state_counts.get("exit_due", 0),
+        "closed_count": state_counts.get("closed", 0),
+        "events_7d": events_7d,
+        "overall_health": overall_health,
+    }
+
+
 MIN_OBSERVATIONS_FOR_VERDICT = 20  # SIGNAL_TRACKER_REQUIREMENTS.md §9 reporting rule
 
 
@@ -205,12 +236,17 @@ def render() -> str:
         events = _recent_events(conn)
         action_items = _action_required(conn)
         ledger_summary = _ledger_summary(conn)
+        insights = _insights_bar(conn, action_items, health_rows)
         conn.close()
     else:
         latest_date, snapshot, stats = None, [], {}
         events = []
         action_items = []
         ledger_summary = []
+        insights = {
+            "needs_attention": 0, "urgent_window_end": None, "open_count": 0,
+            "closed_count": 0, "events_7d": 0, "overall_health": "red",
+        }
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -347,6 +383,19 @@ def render() -> str:
     padding: 6px 10px; border-radius: 6px; margin-bottom: 10px; width: 240px; font-size: 0.85rem;
   }}
   .maxrows {{ color: var(--muted); font-size: 0.78rem; margin-top: 8px; }}
+  .insights-bar {{
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px;
+  }}
+  @media (max-width: 700px) {{ .insights-bar {{ grid-template-columns: repeat(2, 1fr); }} }}
+  .stat-tile {{
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; text-align: center;
+  }}
+  .stat-tile.attn {{ border-color: var(--amber); }}
+  .stat-value {{ font-size: 1.7rem; font-weight: 700; line-height: 1.1; }}
+  .stat-tile.attn .stat-value {{ color: var(--amber); }}
+  .stat-label {{ color: var(--muted); font-size: 0.78rem; margin-top: 4px; }}
+  .stat-sub {{ color: var(--muted); font-size: 0.7rem; margin-top: 4px; min-height: 1em; }}
 </style>
 </head>
 <body>
@@ -354,6 +403,34 @@ def render() -> str:
   <div class="meta">Generated {generated_at} &middot; {coverage_note}</div>
 
   {banner_html}
+
+  <div class="insights-bar">
+    <div class="stat-tile {'attn' if insights['needs_attention'] else ''}">
+      <div class="stat-value">{insights['needs_attention']}</div>
+      <div class="stat-label">Needs attention</div>
+      {f'<div class="stat-sub">next window ends {html.escape(insights["urgent_window_end"])}</div>' if insights['urgent_window_end'] else '<div class="stat-sub">&nbsp;</div>'}
+    </div>
+    <div class="stat-tile">
+      <div class="stat-value">{insights['open_count']}</div>
+      <div class="stat-label">Open / exit-due</div>
+      <div class="stat-sub">&nbsp;</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-value">{insights['closed_count']}</div>
+      <div class="stat-label">Closed (paper)</div>
+      <div class="stat-sub">{max(0, MIN_OBSERVATIONS_FOR_VERDICT - insights['closed_count'])} more for a verdict</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-value">{insights['events_7d']}</div>
+      <div class="stat-label">Events (7d)</div>
+      <div class="stat-sub">&nbsp;</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-value"><span class="dot {insights['overall_health']}"></span>{insights['overall_health'].upper()}</div>
+      <div class="stat-label">Data health</div>
+      <div class="stat-sub">&nbsp;</div>
+    </div>
+  </div>
 
   <div class="panel">
     <h2>Health</h2>
