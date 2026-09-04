@@ -6,9 +6,13 @@ render correctly with the network disconnected.
 
 Health strip reads data/health.json directly (updated by every `run_collect.py` run) so it
 stays accurate even if the database hasn't been rebuilt yet. Everything else reads
-data/tracker.db. Action-required / calendar / ledger / recent-transitions sections are
-placeholders until Phase 3 (events) and Phase 4 (signal state machine + ledger) exist —
-they say so plainly rather than rendering fabricated rows.
+data/tracker.db. Recent state transitions remains a placeholder — signals/ledger only
+store current state, not a change history, so there's nothing real to show yet.
+
+Every list-of-rows panel (Action required, Outlier moments, Recent events) is
+click-to-expand: each row has a hidden detail row beneath it with the full underlying
+record, toggled by plain JS (no framework) — a flat table plus a click target, not a
+separate drill-down view.
 
 Usage:
     python src/render_dashboard.py
@@ -18,10 +22,15 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
+import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import regime  # noqa: E402
+
 DATA_ROOT = REPO_ROOT / "data"
 DB_PATH = DATA_ROOT / "tracker.db"
 HEALTH_JSON_PATH = DATA_ROOT / "health.json"
@@ -122,7 +131,7 @@ def _recent_events(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
     try:
         rows = conn.execute(
             """
-            SELECT event_type, symbol, effective_date, source_file
+            SELECT event_type, symbol, effective_date, source_file, detail
             FROM events
             WHERE event_type IN ('fo_ban_entry', 'fo_ban_exit')
             ORDER BY effective_date DESC, symbol
@@ -133,8 +142,9 @@ def _recent_events(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
     except sqlite3.OperationalError:
         return []  # events table doesn't exist yet (build_events.py not run)
     return [
-        {"event_type": t, "symbol": s, "effective_date": d, "source_file": sf}
-        for t, s, d, sf in rows
+        {"event_type": t, "symbol": s, "effective_date": d, "source_file": sf,
+         "detail": json.loads(dj) if dj else {}}
+        for t, s, d, sf, dj in rows
     ]
 
 
@@ -176,7 +186,8 @@ def _action_required(conn: sqlite3.Connection) -> list[dict]:
     try:
         rows = conn.execute(
             """
-            SELECT symbol, signal_type, state, window_end
+            SELECT symbol, signal_type, state, window_end, armed_date, window_start,
+                   entry_date, entry_ref_price, stop_price, filters_passed
             FROM signals
             WHERE state IN ('armed', 'open', 'exit_due')
             ORDER BY (window_end IS NULL), window_end
@@ -184,7 +195,15 @@ def _action_required(conn: sqlite3.Connection) -> list[dict]:
         ).fetchall()
     except sqlite3.OperationalError:
         return []
-    return [{"symbol": s, "signal_type": t, "state": st, "window_end": we} for s, t, st, we in rows]
+    out = []
+    for s, t, st, we, armed, ws, ed, erp, sp, fp in rows:
+        out.append({
+            "symbol": s, "signal_type": t, "state": st, "window_end": we,
+            "armed_date": armed, "window_start": ws, "entry_date": ed,
+            "entry_ref_price": erp, "stop_price": sp,
+            "filters_passed": json.loads(fp) if fp else {},
+        })
+    return out
 
 
 def _ledger_summary(conn: sqlite3.Connection) -> list[dict]:
@@ -219,12 +238,80 @@ def _ledger_summary(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
+def _outlier_trades(conn: sqlite3.Connection, limit: int = 3) -> dict:
+    """Best and worst closed paper trades by net return — the extremes, not a flat
+    chronological dump. This is what the "outlier moments at front" ask is about: a plain
+    events list buries the KAYNES +18%/-12% swing the same way it buries a routine +1%
+    trade; this surfaces it directly."""
+    try:
+        best = conn.execute(
+            """
+            SELECT s.symbol, s.signal_type, l.direction, l.entry_date, l.entry_price,
+                   l.exit_date, l.exit_price, l.exit_reason, l.net_return_pct, l.holding_days
+            FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
+            WHERE l.exit_date IS NOT NULL
+            ORDER BY l.net_return_pct DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        worst = conn.execute(
+            """
+            SELECT s.symbol, s.signal_type, l.direction, l.entry_date, l.entry_price,
+                   l.exit_date, l.exit_price, l.exit_reason, l.net_return_pct, l.holding_days
+            FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
+            WHERE l.exit_date IS NOT NULL
+            ORDER BY l.net_return_pct ASC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {"best": [], "worst": []}
+
+    def _row(r):
+        sym, styp, direction, ed, ep, xd, xp, reason, net, hold = r
+        return {
+            "symbol": sym, "signal_type": styp, "direction": direction,
+            "entry_date": ed, "entry_price": ep, "exit_date": xd, "exit_price": xp,
+            "exit_reason": reason, "net_return_pct": net, "holding_days": hold,
+        }
+
+    return {"best": [_row(r) for r in best], "worst": [_row(r) for r in worst]}
+
+
+def _calendar_upcoming(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+    """Real forward-looking content per SIGNAL_TRACKER_REQUIREMENTS.md §10 ("next 30
+    days of known effective dates") — window_end dates for signals still in flight,
+    within `days` of the latest archived trading day. Empty until a signal is actually
+    open/armed with a resolvable window; that's an honest empty state, not a
+    placeholder."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT symbol, signal_type, state, window_end
+            FROM signals
+            WHERE window_end IS NOT NULL
+              AND state IN ('open', 'exit_due')
+              AND julianday(window_end) - julianday((SELECT MAX(date) FROM prices)) BETWEEN 0 AND ?
+            ORDER BY window_end
+            """,
+            (days,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"symbol": s, "signal_type": t, "state": st, "window_end": we} for s, t, st, we in rows]
+
+
 def _fmt(v, spec="") -> str:
     if v is None:
         return "&mdash;"
     if spec:
         return format(v, spec)
     return html.escape(str(v))
+
+
+def _detail_row(colspan: int, inner: str) -> str:
+    """A hidden row beneath an `.expandable` row, revealed by toggleDetail() on click."""
+    return f'<tr class="detail-row" hidden><td colspan="{colspan}"><div class="detail-box">{inner}</div></td></tr>'
 
 
 def render() -> str:
@@ -237,6 +324,9 @@ def render() -> str:
         action_items = _action_required(conn)
         ledger_summary = _ledger_summary(conn)
         insights = _insights_bar(conn, action_items, health_rows)
+        outliers = _outlier_trades(conn)
+        calendar_items = _calendar_upcoming(conn)
+        regime_info = regime.compute_regime(conn)
         conn.close()
     else:
         latest_date, snapshot, stats = None, [], {}
@@ -247,6 +337,9 @@ def render() -> str:
             "needs_attention": 0, "urgent_window_end": None, "open_count": 0,
             "closed_count": 0, "events_7d": 0, "overall_health": "red",
         }
+        outliers = {"best": [], "worst": []}
+        calendar_items = []
+        regime_info = None
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -286,12 +379,19 @@ def render() -> str:
 
     action_html = "\n".join(
         f"""
-        <tr>
-          <td>{html.escape(a['symbol'])}</td>
+        <tr class="expandable" onclick="toggleDetail(this)">
+          <td>{html.escape(a['symbol'])} <span class="expand-hint">&#9662;</span></td>
           <td>{html.escape(a['signal_type'])}</td>
           <td>{html.escape(a['state'])}</td>
           <td>{html.escape(a['window_end']) if a['window_end'] else '&mdash;'}</td>
-        </tr>"""
+        </tr>
+        {_detail_row(4,
+            f"Armed {html.escape(a['armed_date'] or '—')} &middot; "
+            f"Window {html.escape(a['window_start'] or '—')} &rarr; {html.escape(a['window_end'] or 'pending')}<br>"
+            f"Entry {html.escape(a['entry_date'] or 'pending')} @ {_fmt(a['entry_ref_price'], '.2f')} &middot; "
+            f"Stop (long side) {_fmt(a['stop_price'], '.2f')}<br>"
+            f"Filters: {html.escape(json.dumps(a['filters_passed']))}"
+        )}"""
         for a in action_items
     ) or '<tr><td colspan="4">Nothing pending &mdash; no signal is currently armed, open, or exit-due.</td></tr>'
 
@@ -312,16 +412,70 @@ def render() -> str:
 
     events_html = "\n".join(
         f"""
-        <tr>
+        <tr class="expandable" onclick="toggleDetail(this)">
           <td>{html.escape(e['effective_date'])}</td>
-          <td>{html.escape(e['symbol'])}</td>
+          <td>{html.escape(e['symbol'])} <span class="expand-hint">&#9662;</span></td>
           <td class="{'neg' if e['event_type'] == 'fo_ban_entry' else 'pos'}">
             {'entered ban' if e['event_type'] == 'fo_ban_entry' else 'exited ban'}
           </td>
           <td style="font-size:0.78rem;color:var(--muted)">{html.escape(e['source_file'])}</td>
-        </tr>"""
+        </tr>
+        {_detail_row(4, f"Raw detail: {html.escape(json.dumps(e['detail'])) if e['detail'] else 'none recorded'}")}"""
         for e in events
     ) or '<tr><td colspan="4">No events yet &mdash; run build_events.py after collecting fo_ban data.</td></tr>'
+
+    def _outlier_row(o: dict) -> str:
+        net = o["net_return_pct"] or 0.0
+        cls = "pos" if net > 0 else "neg" if net < 0 else ""
+        return f"""
+        <tr class="expandable" onclick="toggleDetail(this)">
+          <td>{html.escape(o['symbol'])} <span class="expand-hint">&#9662;</span></td>
+          <td>{html.escape(o['signal_type'])}</td>
+          <td>{html.escape(o['direction'])}</td>
+          <td class="num {cls}">{_fmt(o['net_return_pct'], '+.2f')}%</td>
+          <td>{html.escape(o['exit_reason'] or '—')}</td>
+        </tr>
+        {_detail_row(5,
+            f"Entry {html.escape(o['entry_date'] or '—')} @ {_fmt(o['entry_price'], '.2f')} &rarr; "
+            f"Exit {html.escape(o['exit_date'] or '—')} @ {_fmt(o['exit_price'], '.2f')}<br>"
+            f"Held {o['holding_days'] if o['holding_days'] is not None else '—'} calendar days &middot; "
+            f"net {_fmt(o['net_return_pct'], '+.2f')}% after costs"
+        )}"""
+
+    outlier_rows = outliers.get("best", [])[:3] + outliers.get("worst", [])[:3]
+    # de-dupe in case best/worst overlap on a tiny sample
+    seen_ids = set()
+    outlier_rows_dedup = []
+    for o in outlier_rows:
+        key = (o["symbol"], o["entry_date"], o["direction"])
+        if key not in seen_ids:
+            seen_ids.add(key)
+            outlier_rows_dedup.append(o)
+    outlier_rows_dedup.sort(key=lambda o: o["net_return_pct"] or 0.0, reverse=True)
+    outliers_html = "\n".join(_outlier_row(o) for o in outlier_rows_dedup) or (
+        '<tr><td colspan="5">No closed trades yet &mdash; nothing to rank.</td></tr>'
+    )
+
+    calendar_html = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(c['window_end'])}</td>
+          <td>{html.escape(c['symbol'])}</td>
+          <td>{html.escape(c['signal_type'])}</td>
+          <td>{html.escape(c['state'])}</td>
+        </tr>"""
+        for c in calendar_items
+    ) or '<tr><td colspan="4">Nothing due in the next 30 days &mdash; no open or exit-due signal has a window ending soon.</td></tr>'
+
+    if regime_info is None:
+        regime_line = "No closed trades yet, nothing to compare against."
+    elif regime_info["nifty_pct"] is None:
+        regime_line = f"No NIFTY 50 data yet for {regime_info['start_date']} to {regime_info['end_date']} — run <code>python src/build_index.py --live</code>."
+    else:
+        regime_line = (
+            f"NIFTY 50 moved <strong>{regime_info['nifty_pct']:+.2f}%</strong> over the same window "
+            f"({regime_info['start_date']} to {regime_info['end_date']}) &mdash; read the mean-net figures above against this, not in isolation."
+        )
 
     coverage_note = (
         f"{stats.get('distinct_dates', 0)} trading day(s) archived "
@@ -396,6 +550,15 @@ def render() -> str:
   .stat-tile.attn .stat-value {{ color: var(--amber); }}
   .stat-label {{ color: var(--muted); font-size: 0.78rem; margin-top: 4px; }}
   .stat-sub {{ color: var(--muted); font-size: 0.7rem; margin-top: 4px; min-height: 1em; }}
+  tr.expandable {{ cursor: pointer; }}
+  tr.expandable:hover {{ background: color-mix(in srgb, var(--accent) 8%, transparent); }}
+  .expand-hint {{ color: var(--muted); font-size: 0.7rem; }}
+  tr.detail-row td {{ border-bottom: 1px solid var(--border); padding: 0; }}
+  .detail-box {{
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    border-left: 3px solid var(--accent); margin: 4px 0; padding: 10px 14px;
+    font-size: 0.82rem; line-height: 1.6; color: var(--text);
+  }}
 </style>
 </head>
 <body>
@@ -433,6 +596,15 @@ def render() -> str:
   </div>
 
   <div class="panel">
+    <h2>Outlier moments</h2>
+    <table>
+      <thead><tr><th>Symbol</th><th>Signal type</th><th>Direction</th><th>Net return</th><th>Exit reason</th></tr></thead>
+      <tbody>{outliers_html}</tbody>
+    </table>
+    <div class="maxrows">Best and worst closed paper trades by net return, click a row for the full trace. Not a forecast &mdash; a record of what already happened (§9).</div>
+  </div>
+
+  <div class="panel">
     <h2>Health</h2>
     <table>
       <thead><tr><th>Source</th><th>Last success</th><th>Last attempt</th><th>Consecutive failures</th><th>Last error</th></tr></thead>
@@ -459,7 +631,11 @@ def render() -> str:
 
   <div class="panel">
     <h2>Calendar (next 30 days)</h2>
-    <div class="placeholder">Not available yet &mdash; requires Phase 4 (signal windows). Phase 3 only detects events after the fact; it doesn't project forward.</div>
+    <table>
+      <thead><tr><th>Window ends</th><th>Symbol</th><th>Signal type</th><th>State</th></tr></thead>
+      <tbody>{calendar_html}</tbody>
+    </table>
+    <div class="maxrows">Known window-end dates for signals currently open or exit-due, within 30 days of the latest archived trading day.</div>
   </div>
 
   <div class="panel">
@@ -484,7 +660,7 @@ def render() -> str:
       <thead><tr><th>Type</th><th>Direction</th><th>Mode</th><th>Closed</th><th>Hit rate</th><th>Mean net</th><th>Worst</th><th>Verdict</th></tr></thead>
       <tbody>{ledger_html}</tbody>
     </table>
-    <div class="maxrows">Net return only (costs included), per §9. No verdict below {MIN_OBSERVATIONS_FOR_VERDICT} closed observations &mdash; count reported instead.</div>
+    <div class="maxrows">Net return only (costs included), per §9. No verdict below {MIN_OBSERVATIONS_FOR_VERDICT} closed observations &mdash; count reported instead.<br>{regime_line}</div>
   </div>
 
   <div class="panel">
@@ -493,6 +669,12 @@ def render() -> str:
   </div>
 
 <script>
+function toggleDetail(row) {{
+  const detail = row.nextElementSibling;
+  if (detail && detail.classList.contains('detail-row')) {{
+    detail.hidden = !detail.hidden;
+  }}
+}}
 function filterTable() {{
   const q = document.getElementById('search').value.toLowerCase();
   const rows = document.querySelectorAll('#priceTable tbody tr');

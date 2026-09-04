@@ -22,10 +22,14 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import regime  # noqa: E402
 DATA_ROOT = REPO_ROOT / "data"
 DB_PATH = DATA_ROOT / "tracker.db"
 HEALTH_JSON_PATH = DATA_ROOT / "health.json"
@@ -148,6 +152,28 @@ def section_manual_queue() -> str:
     return "**5. Manual queue**\n\n- not implemented yet — no manual-entry seed workflow exists (Phase 6)\n"
 
 
+def regime_comparison(conn: sqlite3.Connection) -> str:
+    """§9.8's required beta context, as a markdown line. Computation is shared with the
+    dashboard via src/regime.py so the two surfaces never disagree."""
+    result = regime.compute_regime(conn)
+    if result is None:
+        return "**8. Regime comparison** — no closed trades yet, nothing to compare against.\n"
+    if result["nifty_pct"] is None:
+        return (
+            "**8. Regime comparison** — no NIFTY 50 data yet for "
+            f"{result['start_date']} to {result['end_date']}. Run `python src/build_index.py --live`. "
+            "Signal performance above should not be read as edge until this exists "
+            "(§9: \"signal performance is never presented without its beta context\").\n"
+        )
+    return (
+        f"**8. Regime comparison** — NIFTY 50 moved {result['nifty_pct']:+.2f}% over the same "
+        f"window the closed sample spans ({result['start_date']} to {result['end_date']}). Compare this "
+        "against the mean net figures above before reading any of them as edge — a "
+        "positive mean net in a strongly rising regime is weaker evidence than the same "
+        "figure in a flat or falling one.\n"
+    )
+
+
 def section_weekly_performance(conn: sqlite3.Connection) -> str:
     """§9 steps 6-8, weekly only. Net return only, never pooled, 20-observation floor."""
     lines = ["**6. Per-type performance (paper)**", ""]
@@ -185,7 +211,7 @@ def section_weekly_performance(conn: sqlite3.Connection) -> str:
             lines.append(f"**Kill candidates (§9.8):** {', '.join(kill_candidates)}\n")
 
     lines.append("**7. Taken vs. skipped** — not implemented yet (no notion of \"taken\" vs \"skipped\" is tracked; every armed signal is currently logged automatically in paper mode, so there is no skip set to compare against yet).\n")
-    lines.append("**8. Regime comparison** — not available yet: no index (e.g. NIFTY 50) price source is configured. Signal performance above should not be read as edge until this exists (§9: \"signal performance is never presented without its beta context\").\n")
+    lines.append(regime_comparison(conn))
     return "\n".join(lines)
 
 

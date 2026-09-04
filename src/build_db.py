@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (symbol, date)
 );
 
+CREATE TABLE IF NOT EXISTS index_prices (
+    index_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    close REAL,
+    source TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    PRIMARY KEY (index_name, date)
+);
+
 CREATE TABLE IF NOT EXISTS health (
     source TEXT PRIMARY KEY,
     last_attempt TEXT,
