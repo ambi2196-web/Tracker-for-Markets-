@@ -29,7 +29,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+import dispersion  # noqa: E402
+import ledger as ledger_api  # noqa: E402
 import regime  # noqa: E402
+import verdict  # noqa: E402
 DATA_ROOT = REPO_ROOT / "data"
 DB_PATH = DATA_ROOT / "tracker.db"
 HEALTH_JSON_PATH = DATA_ROOT / "health.json"
@@ -145,11 +148,35 @@ def section_unarmed_events(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def section_manual_queue() -> str:
-    """§9 step 5. No manual-queue mechanism exists yet (Phase 6: seed/ipo_listings.csv,
-    seed/index_events.csv). Say so rather than rendering an empty list that implies the
-    feature works."""
-    return "**5. Manual queue**\n\n- not implemented yet — no manual-entry seed workflow exists (Phase 6)\n"
+def section_manual_queue(conn: sqlite3.Connection | None) -> str:
+    """§9 step 5: unstructured items requiring human entry. Since Phase 8 that is a real
+    list — open research prompts (go read) and theses past their review date (record an
+    outcome) are exactly the items only a human can clear."""
+    lines = ["**5. Manual queue**", ""]
+    if conn is None:
+        lines.append("- no database yet\n")
+        return "\n".join(lines)
+
+    prompts = dispersion.open_prompts(conn, limit=MAX_LIST_ITEMS)
+    theses = ledger_api.theses_past_review(conn)
+
+    if not prompts and not theses:
+        lines.append("- nothing pending — no open research prompts, no thesis past review\n")
+        return "\n".join(lines)
+
+    for p in prompts:
+        lines.append(
+            f"- 📖 **Read:** `{p['sector']}` — median constituent {p['spread']:+.1f}pp vs index "
+            f"over {p['window_days']} trading days (detected {p['detected_date']}). "
+            "Research prompt, not a signal."
+        )
+    for t in theses:
+        lines.append(
+            f"- ⚖️ **Review due {t['review_date']}:** `{t['subject']}` — falsifier as written: "
+            f"\"{t['falsifier']}\""
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def regime_comparison(conn: sqlite3.Connection) -> str:
@@ -175,38 +202,33 @@ def regime_comparison(conn: sqlite3.Connection) -> str:
 
 
 def section_weekly_performance(conn: sqlite3.Connection) -> str:
-    """§9 steps 6-8, weekly only. Net return only, never pooled, 20-observation floor."""
-    lines = ["**6. Per-type performance (paper)**", ""]
-    rows = conn.execute(
-        """
-        SELECT s.signal_type, l.direction, l.mode, COUNT(*) AS n,
-               AVG(l.net_return_pct) AS mean_net,
-               SUM(CASE WHEN l.net_return_pct > 0 THEN 1 ELSE 0 END) AS wins,
-               MIN(l.net_return_pct) AS worst,
-               AVG(l.holding_days) AS mean_hold
-        FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
-        WHERE l.exit_date IS NOT NULL
-        GROUP BY s.signal_type, l.direction, l.mode
-        ORDER BY s.signal_type, l.direction
-        """
-    ).fetchall()
-    if not rows:
-        lines.append("- no closed paper trades yet\n")
+    """§9 steps 6-8, weekly only. Net return only, never pooled across paper/live,
+    long/short, or — since Phase 8 — across tracks. Reads the shared verdict module so
+    this table and the dashboard's can never drift apart."""
+    lines = ["**6. Track A per-cohort performance (mechanism, paper)**", ""]
+    cohorts = verdict.cohort_verdicts(conn)
+    if not cohorts:
+        lines.append("- no closed mechanism trades yet\n")
     else:
-        lines.append("| Type | Direction | Mode | Closed | Hit rate | Mean net | Worst | Verdict |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| Type | Direction | n | Hit rate | Mean net | Median net | Worst | Mean hold | NIFTY (matched) | Spread | Verdict |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
         kill_candidates = []
-        for sig_type, direction, mode, n, mean_net, wins, worst, mean_hold in rows:
-            hit_rate = f"{wins/n*100:.0f}%" if n else "—"
-            if n >= MIN_OBSERVATIONS_FOR_VERDICT:
-                verdict = "kill candidate" if mean_net is not None and mean_net < 0 else "tracking"
-                if verdict == "kill candidate":
-                    kill_candidates.append(f"{sig_type}/{direction}/{mode}")
-            else:
-                verdict = f"insufficient sample ({n}/{MIN_OBSERVATIONS_FOR_VERDICT})"
-            lines.append(f"| {sig_type} | {direction} | {mode} | {n} | {hit_rate} | "
-                          f"{mean_net:+.2f}% | {worst:+.2f}% | {verdict} |")
+        for c in cohorts:
+            if c["verdict"] == verdict.LABEL_NO_EDGE:
+                kill_candidates.append(f"{c['signal_type']}/{c['direction']}/{c['mode']}")
+            matched = f"{c['matched_nifty']:+.2f}%" if c["matched_nifty"] is not None else "—"
+            spread = f"{c['spread']:+.2f}pp" if c["spread"] is not None else "—"
+            hold = f"{c['mean_holding_days']:.1f}d" if c["mean_holding_days"] is not None else "—"
+            lines.append(
+                f"| {c['signal_type']} | {c['direction']} | {c['n']} | {c['hit_rate']:.0f}% | "
+                f"{c['mean_net']:+.2f}% | {c['median_net']:+.2f}% | {c['worst']:+.2f}% | {hold} | "
+                f"{matched} | {spread} | {c['verdict']} |"
+            )
         lines.append("")
+        lines.append(
+            "_NIFTY column is the mean return over each trade's own entry→exit window, not a global "
+            "span — a cohort of 5-day trades compared against a 12-month drift is not a comparison._\n"
+        )
         if kill_candidates:
             lines.append(f"**Kill candidates (§9.8):** {', '.join(kill_candidates)}\n")
 
@@ -231,7 +253,7 @@ def render(*, weekly: bool) -> str:
         parts.append(section_transitions(conn, since_iso))
         parts.append(section_action_required(conn))
         parts.append(section_unarmed_events(conn))
-    parts.append(section_manual_queue())
+    parts.append(section_manual_queue(conn))
     if weekly and conn is not None:
         parts.append(section_weekly_performance(conn))
 

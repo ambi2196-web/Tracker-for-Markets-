@@ -117,9 +117,78 @@ CREATE TABLE IF NOT EXISTS signals (
     pipeline_version TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS thesis (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    created_date TEXT NOT NULL,
+    claim TEXT NOT NULL,
+    counter_claim TEXT NOT NULL,
+    falsifier TEXT NOT NULL,
+    horizon_months INTEGER,
+    review_date TEXT,
+    status TEXT NOT NULL,
+    outcome TEXT,
+    falsifier_hit INTEGER,
+    source TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    CHECK (length(trim(falsifier)) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS thesis_revisions (
+    revision_id TEXT PRIMARY KEY,
+    thesis_id TEXT NOT NULL REFERENCES thesis(id),
+    field TEXT NOT NULL,
+    previous_value TEXT NOT NULL,
+    new_value TEXT NOT NULL,
+    revised_at TEXT NOT NULL,
+    reason TEXT,
+    source TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sector_map (
+    symbol TEXT NOT NULL,
+    sector TEXT NOT NULL,
+    company_name TEXT,
+    source TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    PRIMARY KEY (symbol)
+);
+
+CREATE TABLE IF NOT EXISTS research_prompts (
+    prompt_id TEXT PRIMARY KEY,
+    sector TEXT NOT NULL,
+    detected_date TEXT NOT NULL,
+    window_days INTEGER NOT NULL,
+    spread REAL NOT NULL,
+    n_constituents INTEGER,
+    median_constituent_return REAL,
+    index_return REAL,
+    breadth REAL,
+    status TEXT NOT NULL,
+    notes TEXT,
+    source TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    CHECK (status IN ('open', 'investigated', 'dismissed'))
+);
+"""
+
+# Kept separate from SCHEMA_SQL so the Phase 8 migration can recreate exactly this one
+# table without re-running the whole script mid-rename.
+LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS ledger (
     ledger_id TEXT PRIMARY KEY,
-    signal_id TEXT NOT NULL REFERENCES signals(signal_id),
+    signal_id TEXT REFERENCES signals(signal_id),
+    thesis_id TEXT REFERENCES thesis(id),
+    track TEXT NOT NULL DEFAULT 'mechanism',
     mode TEXT NOT NULL,
     direction TEXT NOT NULL,
     entry_date TEXT,
@@ -133,13 +202,50 @@ CREATE TABLE IF NOT EXISTS ledger (
     holding_days INTEGER,
     notes TEXT,
     updated_at TEXT NOT NULL,
-    pipeline_version TEXT NOT NULL
+    pipeline_version TEXT NOT NULL,
+    CHECK (track IN ('mechanism', 'discretionary')),
+    -- Exactly one linkage per track. A mechanism row comes from a signal; a
+    -- discretionary row comes from a thesis and has no signal at all. Enforced here as
+    -- well as in src/ledger.py so it holds even against a direct sqlite write.
+    CHECK (
+        (track = 'mechanism'     AND signal_id IS NOT NULL AND thesis_id IS NULL)
+     OR (track = 'discretionary' AND thesis_id IS NOT NULL AND signal_id IS NULL)
+    )
 );
 """
 
+# SQLite cannot ALTER a NOT NULL away, so widening `ledger` (signal_id becomes nullable,
+# plus new track/thesis_id columns) needs a table rebuild. Mechanism rows are derived and
+# could be regenerated, but discretionary rows never can be — they are operator-authored
+# source data, not derived from raw — so this migration copies rather than drops.
+_LEDGER_MIGRATION_COLUMNS = [
+    "ledger_id", "signal_id", "mode", "direction", "entry_date", "entry_price",
+    "exit_date", "exit_price", "exit_reason", "gross_return_pct", "costs_pct",
+    "net_return_pct", "holding_days", "notes", "updated_at", "pipeline_version",
+]
+
+
+def migrate_schema(conn: sqlite3.Connection) -> bool:
+    """Bring a pre-Phase-8 ledger up to the track-aware shape, preserving every row.
+    Returns True if a migration actually ran. No-op on a fresh or already-migrated db."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(ledger)")}
+    if not existing or {"track", "thesis_id"} <= existing:
+        return False
+
+    cols = ", ".join(_LEDGER_MIGRATION_COLUMNS)
+    conn.execute("ALTER TABLE ledger RENAME TO ledger_pre_phase8")
+    conn.execute(LEDGER_DDL.strip().rstrip(";"))
+    conn.execute(
+        f"INSERT INTO ledger ({cols}, track, thesis_id) "
+        f"SELECT {cols}, 'mechanism', NULL FROM ledger_pre_phase8"
+    )
+    conn.execute("DROP TABLE ledger_pre_phase8")
+    return True
+
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SCHEMA_SQL + LEDGER_DDL)
+    migrate_schema(conn)
 
 
 def discover_bhavcopy_files(data_root: Path) -> list[Path]:

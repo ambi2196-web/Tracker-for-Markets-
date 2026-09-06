@@ -29,7 +29,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+import dispersion  # noqa: E402
+import ledger as ledger_api  # noqa: E402
 import regime  # noqa: E402
+import verdict  # noqa: E402
 
 DATA_ROOT = REPO_ROOT / "data"
 DB_PATH = DATA_ROOT / "tracker.db"
@@ -220,7 +223,7 @@ def _ledger_summary(conn: sqlite3.Connection) -> list[dict]:
                    MIN(l.net_return_pct) AS worst,
                    AVG(l.holding_days) AS mean_holding_days
             FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
-            WHERE l.exit_date IS NOT NULL
+            WHERE l.exit_date IS NOT NULL AND l.track = 'mechanism'
             GROUP BY s.signal_type, l.direction, l.mode
             ORDER BY s.signal_type, l.direction
             """
@@ -249,7 +252,7 @@ def _outlier_trades(conn: sqlite3.Connection, limit: int = 3) -> dict:
             SELECT s.symbol, s.signal_type, l.direction, l.entry_date, l.entry_price,
                    l.exit_date, l.exit_price, l.exit_reason, l.net_return_pct, l.holding_days
             FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
-            WHERE l.exit_date IS NOT NULL
+            WHERE l.exit_date IS NOT NULL AND l.track = 'mechanism'
             ORDER BY l.net_return_pct DESC LIMIT ?
             """,
             (limit,),
@@ -259,7 +262,7 @@ def _outlier_trades(conn: sqlite3.Connection, limit: int = 3) -> dict:
             SELECT s.symbol, s.signal_type, l.direction, l.entry_date, l.entry_price,
                    l.exit_date, l.exit_price, l.exit_reason, l.net_return_pct, l.holding_days
             FROM ledger l JOIN signals s ON s.signal_id = l.signal_id
-            WHERE l.exit_date IS NOT NULL
+            WHERE l.exit_date IS NOT NULL AND l.track = 'mechanism'
             ORDER BY l.net_return_pct ASC LIMIT ?
             """,
             (limit,),
@@ -327,6 +330,9 @@ def render() -> str:
         outliers = _outlier_trades(conn)
         calendar_items = _calendar_upcoming(conn)
         regime_info = regime.compute_regime(conn)
+        verdicts = verdict.cohort_verdicts(conn)
+        research_prompts = dispersion.open_prompts(conn)
+        theses_due = ledger_api.theses_past_review(conn)
         conn.close()
     else:
         latest_date, snapshot, stats = None, [], {}
@@ -340,6 +346,9 @@ def render() -> str:
         outliers = {"best": [], "worst": []}
         calendar_items = []
         regime_info = None
+        verdicts = []
+        research_prompts = []
+        theses_due = []
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -467,6 +476,63 @@ def render() -> str:
         for c in calendar_items
     ) or '<tr><td colspan="4">Nothing due in the next 30 days &mdash; no open or exit-due signal has a window ending soon.</td></tr>'
 
+    _VERDICT_CLASS = {
+        verdict.LABEL_PROMISING: "pos",
+        verdict.LABEL_NO_EDGE: "neg",
+        verdict.LABEL_INSUFFICIENT: "muted-cell",
+        verdict.LABEL_NO_REGIME_DATA: "muted-cell",
+    }
+    verdict_html = "\n".join(
+        f"""
+        <tr>
+          <td>{html.escape(v['signal_type'])}</td>
+          <td>{html.escape(v['direction'])}</td>
+          <td class="num">{v['n']}</td>
+          <td class="num">{v['hit_rate']:.0f}%</td>
+          <td class="num {'pos' if v['mean_net'] > 0 else 'neg' if v['mean_net'] < 0 else ''}">{v['mean_net']:+.2f}%</td>
+          <td class="num {'pos' if v['median_net'] > 0 else 'neg' if v['median_net'] < 0 else ''}">{v['median_net']:+.2f}%</td>
+          <td class="num">{_fmt(v['matched_nifty'], '+.2f') + '%' if v['matched_nifty'] is not None else '&mdash;'}</td>
+          <td class="num {'pos' if (v['spread'] or 0) > 0 else 'neg' if (v['spread'] or 0) < 0 else ''}">{_fmt(v['spread'], '+.2f') + 'pp' if v['spread'] is not None else '&mdash;'}</td>
+          <td class="{_VERDICT_CLASS.get(v['verdict'], '')}"><strong>{html.escape(v['verdict'])}</strong></td>
+        </tr>"""
+        for v in verdicts
+    ) or '<tr><td colspan="9">No closed mechanism trades yet.</td></tr>'
+
+    prompts_html = "\n".join(
+        f"""
+        <tr class="expandable" onclick="toggleDetail(this)">
+          <td>{html.escape(p['sector'])} <span class="expand-hint">&#9662;</span></td>
+          <td>{html.escape(p['detected_date'])}</td>
+          <td class="num neg">{_fmt(p['spread'], '+.1f')}pp</td>
+          <td class="num">{p['n_constituents']}</td>
+          <td>{html.escape(p['status'])}</td>
+        </tr>
+        {_detail_row(5,
+            f"Median constituent {_fmt(p['median_constituent_return'], '+.2f')}% vs index "
+            f"{_fmt(p['index_return'], '+.2f')}% over {p['window_days']} trading days &middot; "
+            f"breadth {_fmt((p['breadth'] or 0) * 100, '.0f')}% of constituents down hard.<br>"
+            "<strong>This is a prompt to go read, not a position.</strong> No entry price, no stop, "
+            "not counted in any performance statistic."
+        )}"""
+        for p in research_prompts
+    ) or '<tr><td colspan="5">Nothing flagged &mdash; no sector is far enough below the index to be worth reading about.</td></tr>'
+
+    theses_html = "\n".join(
+        f"""
+        <tr class="expandable" onclick="toggleDetail(this)">
+          <td>{html.escape(t['subject'])} <span class="expand-hint">&#9662;</span></td>
+          <td>{html.escape(t['review_date'] or '&mdash;')}</td>
+          <td>{html.escape(t['created_date'])}</td>
+          <td>{html.escape(t['status'])}</td>
+        </tr>
+        {_detail_row(4,
+            f"<strong>Falsifier (as originally written):</strong> {html.escape(t['falsifier'])}<br><br>"
+            f"<em>Market is pricing:</em> {html.escape(t['claim'])}<br>"
+            f"<em>You believed it was missing:</em> {html.escape(t['counter_claim'])}"
+        )}"""
+        for t in theses_due
+    ) or '<tr><td colspan="4">No thesis is past its review date.</td></tr>'
+
     if regime_info is None:
         regime_line = "No closed trades yet, nothing to compare against."
     elif regime_info["nifty_pct"] is None:
@@ -553,6 +619,7 @@ def render() -> str:
   tr.expandable {{ cursor: pointer; }}
   tr.expandable:hover {{ background: color-mix(in srgb, var(--accent) 8%, transparent); }}
   .expand-hint {{ color: var(--muted); font-size: 0.7rem; }}
+  td.muted-cell {{ color: var(--muted); }}
   tr.detail-row td {{ border-bottom: 1px solid var(--border); padding: 0; }}
   .detail-box {{
     background: color-mix(in srgb, var(--accent) 5%, transparent);
@@ -596,12 +663,21 @@ def render() -> str:
   </div>
 
   <div class="panel">
-    <h2>Outlier moments</h2>
+    <h2>Track A &mdash; mechanism verdicts</h2>
     <table>
-      <thead><tr><th>Symbol</th><th>Signal type</th><th>Direction</th><th>Net return</th><th>Exit reason</th></tr></thead>
-      <tbody>{outliers_html}</tbody>
+      <thead><tr>
+        <th>Signal type</th><th>Direction</th><th>n</th><th>Hit rate</th>
+        <th>Mean net</th><th>Median net</th><th>NIFTY (matched)</th><th>Spread</th><th>Verdict</th>
+      </tr></thead>
+      <tbody>{verdict_html}</tbody>
     </table>
-    <div class="maxrows">Best and worst closed paper trades by net return, click a row for the full trace. Not a forecast &mdash; a record of what already happened (§9).</div>
+    <div class="maxrows">
+      Closed mechanism trades only &mdash; Track B is never averaged in. NIFTY column is the mean
+      return over <em>each trade's own entry&rarr;exit window</em>, not a global span, so the spread is
+      like-for-like. No verdict below {verdict.MIN_SAMPLE} observations.
+      The strongest label this system can emit is &ldquo;{html.escape(verdict.LABEL_PROMISING)}&rdquo; &mdash;
+      nothing here ever reads as proven.
+    </div>
   </div>
 
   <div class="panel">
@@ -613,11 +689,44 @@ def render() -> str:
   </div>
 
   <div class="panel">
+    <h2>Outlier moments</h2>
+    <table>
+      <thead><tr><th>Symbol</th><th>Signal type</th><th>Direction</th><th>Net return</th><th>Exit reason</th></tr></thead>
+      <tbody>{outliers_html}</tbody>
+    </table>
+    <div class="maxrows">Best and worst closed mechanism trades by net return, click a row for the full trace. Not a forecast &mdash; a record of what already happened (§9).</div>
+  </div>
+
+  <div class="panel">
     <h2>Action required</h2>
     <table>
       <thead><tr><th>Symbol</th><th>Signal type</th><th>State</th><th>Window end</th></tr></thead>
       <tbody>{action_html}</tbody>
     </table>
+  </div>
+
+  <div class="panel">
+    <h2>Track B &mdash; go read about this</h2>
+    <table>
+      <thead><tr><th>Sector</th><th>Detected</th><th>Spread vs index</th><th>Constituents</th><th>Status</th></tr></thead>
+      <tbody>{prompts_html}</tbody>
+    </table>
+    <div class="maxrows">
+      Sectors whose <em>median</em> constituent is far below the index over the last
+      {dispersion.LOOKBACK_TRADING_DAYS} trading days (trigger: {dispersion.SECTOR_SPREAD_TRIGGER}pp,
+      minimum {dispersion.MIN_CONSTITUENTS} constituents). These are research prompts, not signals:
+      no entry price, no stop, never counted in any performance statistic. The question they raise is
+      whether a temporary input shock is being priced as permanent impairment &mdash; which only reading can answer.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Track B &mdash; theses past review date</h2>
+    <table>
+      <thead><tr><th>Subject</th><th>Review due</th><th>Opened</th><th>Status</th></tr></thead>
+      <tbody>{theses_html}</tbody>
+    </table>
+    <div class="maxrows">Click through for the falsifier <em>as originally written</em>. It cannot be edited once the position opens &mdash; that is the whole point.</div>
   </div>
 
   <div class="panel">

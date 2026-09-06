@@ -5,6 +5,7 @@ data/*.db
 data/*.db-journal
 data/health.json
 data/last_review_at.txt
+data/digest_state.json
 
 # Fully derived outputs (regenerate, don't version)
 out/
